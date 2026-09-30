@@ -52,6 +52,16 @@ class PlantController:
             "counts": self.runtime.audit.counts(),
         }
 
+    def shift_view(self) -> dict[str, Any]:
+        return {
+            "station": self.runtime.config.station,
+            "tick": self.runtime.clock.now(),
+            "summary": self.runtime.shifts.status(),
+            "ledger": self.runtime.shifts.list_shifts(),
+            "history": self.runtime.shifts.history(),
+            "verification": self.runtime.shifts.verify(),
+        }
+
     def manifest(self) -> dict[str, Any]:
         return describe_manifest(
             station=self.runtime.config.station,

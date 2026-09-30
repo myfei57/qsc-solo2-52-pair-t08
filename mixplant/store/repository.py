@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from ..clock import Clock
 from ..errors import NotDurableError, RecordError, RestoreError, UnknownRecordError
@@ -17,6 +17,8 @@ from .replay import merge_state, reduce_state
 from .snapshot import Snapshot, SnapshotStore
 from .tombstone import effective_records, rollback_targets
 from .watermark import Watermark, advance_watermark
+
+FreezeLine = Callable[[], int | None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,11 +49,14 @@ class RecordRepository:
         snapshots: SnapshotStore,
         clock: Clock,
         ids: SequenceIds,
+        *,
+        freeze_line: FreezeLine | None = None,
     ) -> None:
         self._backend = backend
         self._snapshots = snapshots
         self._clock = clock
         self._ids = ids
+        self._freeze_line = freeze_line
         self._records: list[Record] = []
         self._durable_seq = 0
         self._committed_seq = 0
@@ -59,19 +64,72 @@ class RecordRepository:
         self._load_backend()
 
     @classmethod
-    def open(cls, data_dir: Path | str, clock: Clock, ids: SequenceIds) -> "RecordRepository":
+    def open(
+        cls,
+        data_dir: Path | str,
+        clock: Clock,
+        ids: SequenceIds,
+        *,
+        freeze_line: FreezeLine | None = None,
+    ) -> "RecordRepository":
         """Open the store that lives below ``data_dir``."""
 
         root = Path(data_dir)
         backend = FileBackend(root / "journal.jsonl")
         snapshots = SnapshotStore(root / "snapshots")
-        return cls(backend, snapshots, clock, ids)
+        return cls(backend, snapshots, clock, ids, freeze_line=freeze_line)
 
     @classmethod
-    def in_memory(cls, clock: Clock, ids: SequenceIds) -> "RecordRepository":
+    def in_memory(
+        cls,
+        clock: Clock,
+        ids: SequenceIds,
+        *,
+        freeze_line: FreezeLine | None = None,
+    ) -> "RecordRepository":
         """Open a store that never touches the disk."""
 
-        return cls(MemoryBackend(), SnapshotStore(None), clock, ids)
+        return cls(MemoryBackend(), SnapshotStore(None), clock, ids, freeze_line=freeze_line)
+
+    def set_freeze_line(self, freeze_line: FreezeLine | None) -> None:
+        """Install (or clear) the callback that returns the history waterline."""
+
+        self._freeze_line = freeze_line
+
+    def _frozen_waterline(self) -> int | None:
+        if self._freeze_line is None:
+            return None
+        try:
+            return self._freeze_line()
+        except Exception:  # pragma: no cover - a broken guard must fail closed
+            return 0
+
+    def _require_before_freeze(self, seq: int, *, action: str) -> None:
+        """Refuse to let ``seq`` touch any record at or past the freeze line."""
+
+        waterline = self._frozen_waterline()
+        if waterline is not None and seq >= waterline:
+            raise RecordError(
+                "settled shift history is immutable and cannot be rolled back",
+                action=action,
+                requested=seq,
+                frozen_from=waterline,
+            )
+
+    def _require_targets_before_freeze(self, targets: tuple[int, ...], *, action: str) -> None:
+        """Refuse a batch tombstone that reaches a record at or past the line."""
+
+        waterline = self._frozen_waterline()
+        if waterline is None:
+            return
+        hit = next((seq for seq in targets if seq >= waterline), None)
+        if hit is not None:
+            raise RecordError(
+                "settled shift history is immutable and cannot be rolled back",
+                action=action,
+                target=hit,
+                frozen_from=waterline,
+            )
 
     @property
     def snapshots(self) -> SnapshotStore:
@@ -215,6 +273,7 @@ class RecordRepository:
             raise UnknownRecordError("tombstone target does not exist", target=target_seq)
         if target_seq > self._committed_seq:
             raise RecordError("cannot tombstone a record that was never committed", target=target_seq)
+        self._require_before_freeze(target_seq, action="tombstone")
         record = self._append_tombstone(target_seq, reason, origin, generation)
         self.flush()
         self.commit_through(record.seq)
@@ -247,6 +306,7 @@ class RecordRepository:
         targets = rollback_targets(self._records[: self._committed_seq], seq)
         if not targets:
             return ()
+        self._require_targets_before_freeze(targets, action="rollback")
         records = tuple(self._append_tombstone(target, reason, origin, generation) for target in targets)
         self.flush()
         self.commit_through(records[-1].seq)

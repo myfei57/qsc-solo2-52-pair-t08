@@ -35,6 +35,13 @@ from .recipe.recipe import Recipe
 from .recipe.service import RecipeService
 from .sampler.service import SamplerService
 from .service_base import PlantService
+from .shift.capture import collect_plant_facts
+from .shift.constants import (
+    CLOSE_KIND as SHIFT_CLOSE_KIND,
+    CREW_KIND as SHIFT_CREW_KIND,
+    OPEN_KIND as SHIFT_OPEN_KIND,
+)
+from .shift.service import ShiftService
 from .statemachine.gate import PreGate
 from .statemachine.machine import SequenceMachine
 from .statemachine.phases import LINE_SEQUENCES
@@ -110,6 +117,13 @@ class PlantRuntime:
         self.pump = PumpService(self.context, self.machines["delivery"])
         self.sampler = SamplerService(self.context, self.recipes, self.machines["delivery"])
         self.audit = AuditService(self.context, self.machines["batch"], alarms=self.alarms)
+        self.shifts = ShiftService(
+            self.context,
+            self.machines["batch"],
+            factors_provider=self._recipe_factors_by_grade,
+            plant_facts_provider=lambda: collect_plant_facts(self),
+        )
+        self.store.set_freeze_line(self.shifts.registry.earliest_settle_seq)
         self.controller = PlantController(self)
         self.boot_report: RestoreReport | None = None
         self._services: dict[str, PlantService] = {
@@ -123,8 +137,18 @@ class PlantRuntime:
             "pump": self.pump,
             "sampler": self.sampler,
             "audit": self.audit,
+            "shift": self.shifts,
         }
         self._wire_bus()
+
+    def _recipe_factors_by_grade(self) -> dict[str, dict[str, float]]:
+        """Map every current recipe grade to its kg per cubic metre factors."""
+
+        factors: dict[str, dict[str, float]] = {}
+        for name in self.recipes.book.names():
+            recipe = self.recipes.book.current(name)
+            factors[recipe.grade.code] = dict(recipe.factors)
+        return factors
 
     @classmethod
     def in_memory(cls) -> "PlantRuntime":
@@ -175,6 +199,8 @@ class PlantRuntime:
         self.ids.restore("snap", len(self.store.snapshots.load_all()))
         samples = sum(1 for record in self.store.visible() if record.kind == "sampler.record")
         self.ids.restore("sample", samples)
+        settlements = sum(1 for record in self.store.visible() if record.kind == SHIFT_CLOSE_KIND)
+        self.ids.restore("settle", settlements)
 
     def _adopt_records(self) -> None:
         """Adopt everything the stream still carries."""
@@ -228,6 +254,12 @@ class PlantRuntime:
                     1,
                     validity=Validity.never(record.tick),
                 )
+            elif record.kind == SHIFT_CREW_KIND:
+                self.shifts.adopt_crew_record(record.payload)
+            elif record.kind == SHIFT_OPEN_KIND:
+                self.shifts.adopt_shift_record(record.payload)
+            elif record.kind == SHIFT_CLOSE_KIND:
+                self.shifts.adopt_settlement_record(record.payload, record_seq=record.seq)
         self.moist.sync(corrections)
 
     def _hydrate_machines(self) -> None:
@@ -480,6 +512,45 @@ class PlantRuntime:
                 integer(payload, "seq"), reason=optional_text(payload, "reason", "operator rollback")
             ),
             "clock.advance": lambda payload: {"tick": self.advance_ticks(integer(payload, "ticks"))},
+            "shift.crew": lambda payload: self.shifts.register_crew(
+                crew_id=text(payload, "crew_id"),
+                name=optional_text(payload, "name", None),
+                mismatch_policy=text(payload, "mismatch_policy"),
+                tolerance_m3=optional_number(payload, "tolerance_m3", 0.0),
+            ),
+            "shift.open": lambda payload: self.shifts.open_shift(
+                shift_id=text(payload, "shift_id"), crew_id=text(payload, "crew_id")
+            ),
+            "shift.production": lambda payload: self.shifts.record_production(
+                shift_id=text(payload, "shift_id"),
+                batch_id=text(payload, "batch_id"),
+                grade=text(payload, "grade"),
+                volume_m3=number(payload, "volume_m3"),
+            ),
+            "shift.loading": lambda payload: self.shifts.record_loading(
+                shift_id=text(payload, "shift_id"),
+                slip_id=text(payload, "slip_id"),
+                grade=text(payload, "grade"),
+                volume_m3=number(payload, "volume_m3"),
+                truck_id=optional_text(payload, "truck_id", ""),
+            ),
+            "shift.usage": lambda payload: self.shifts.record_usage(
+                shift_id=text(payload, "shift_id"),
+                grade=text(payload, "grade"),
+                material=text(payload, "material"),
+                consumed_kg=number(payload, "consumed_kg"),
+            ),
+            "shift.capture": lambda payload: self.shifts.capture_from_plant(
+                shift_id=text(payload, "shift_id")
+            ),
+            "shift.reconcile": lambda payload: self.shifts.reconcile(
+                shift_id=text(payload, "shift_id"),
+                tolerance_m3=None if payload.get("tolerance_m3") in (None, "") else number(payload, "tolerance_m3"),
+            ),
+            "shift.settle": lambda payload: self.shifts.settle(
+                shift_id=text(payload, "shift_id"),
+                tolerance_m3=None if payload.get("tolerance_m3") in (None, "") else number(payload, "tolerance_m3"),
+            ),
         }
 
     def dispatch(self, command: str, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
