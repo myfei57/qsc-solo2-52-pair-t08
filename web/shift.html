@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <title>班次结算</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; background: #f5f6f8; color: #1c1f24; }
+    table { border-collapse: collapse; width: 100%; background: #fff; margin-bottom: 1rem; }
+    th, td { border: 1px solid #d7dbe0; padding: 0.4rem 0.6rem; text-align: left; font-size: 0.88rem; }
+    form { background: #fff; padding: 0.8rem 1rem; border: 1px solid #d7dbe0; margin-bottom: 0.8rem; }
+    input, button, select { padding: 0.35rem 0.5rem; margin: 0.15rem; }
+    nav a { margin-right: 0.8rem; }
+    .tag { padding: 0.1rem 0.45rem; border-radius: 0.6rem; font-size: 0.78rem; }
+    .settled { background: #d8f0dd; }
+    .suspended { background: #fbe3c2; }
+    .reconciled { background: #dcebfa; }
+    .open, .closed { background: #eceef1; }
+    .diff { color: #a33; font-weight: 600; }
+    h2 { margin-top: 1.6rem; }
+  </style>
+</head>
+<body>
+  <nav><a href="/pages/recipe">recipe</a><a href="/pages/batch">batch</a><a href="/pages/discharge">discharge</a><a href="/pages/alarms">alarms</a><a href="/pages/shift">班次结算</a></nav>
+  <h1>班次结算</h1>
+
+  <h2>班组（策略定死后不可改）</h2>
+  <form id="crew">
+    <input name="crew_id" placeholder="班组号 A" value="A">
+    <input name="name" placeholder="班组名" value="甲班">
+    <select name="mismatch_policy">
+      <option value="suspend">整班挂起</option>
+      <option value="list_diffs">单列差异继续结</option>
+    </select>
+    <input name="tolerance_m3" value="0.5" size="4"> m³
+    <button type="submit">登记班组</button>
+  </form>
+  <table id="crews"><thead><tr><th>班组号</th><th>名称</th><th>对不上时</th><th>容差 m³</th></tr></thead><tbody></tbody></table>
+
+  <h2>开班 / 录入</h2>
+  <form id="open">
+    <input name="shift_id" placeholder="班次号" value="S-001">
+    <input name="crew_id" placeholder="班组号" value="A">
+    <button type="submit">开班</button>
+  </form>
+  <form id="tray">
+    <input name="shift_id" value="S-001" size="7">
+    打盘 <input name="ref" placeholder="单号" value="tray-1">
+    标号 <input name="grade" value="C30" size="5">
+    方量 <input name="volume_m3" value="6" size="4">
+    <button type="submit">记一盘</button>
+  </form>
+  <form id="slip">
+    <input name="shift_id" value="S-001" size="7">
+    装车单 <input name="ref" placeholder="单号" value="slip-1">
+    标号 <input name="grade" value="C30" size="5">
+    方量 <input name="volume_m3" value="12" size="4">
+    <button type="submit">记装车单</button>
+  </form>
+  <form id="usage">
+    <input name="shift_id" value="S-001" size="7">
+    配方用量 <input name="ref" value="use-1" size="7">
+    标号 <input name="grade" value="C30" size="5">
+    材料 <input name="material" value="cement" size="8">
+    用量 kg <input name="consumed_kg" value="3960" size="7">
+    单方系数 <input name="factor_kg_per_m3" value="330" size="5">
+    <button type="submit">记配方用量</button>
+  </form>
+  <form id="capture"><input name="shift_id" value="S-001" size="7"><button type="submit">从生产/装车台账抓取</button></form>
+  <form id="preview"><input name="shift_id" value="S-001" size="7"><button type="submit">试算（不落账）</button></form>
+  <pre id="preview-out"></pre>
+
+  <h2>对账 / 结算 / 挂起处理</h2>
+  <form id="reconcile">
+    <input name="shift_id" value="S-001" size="7">
+    <input name="idempotency_key" placeholder="幂等键(可选)">
+    <button type="submit">对账</button>
+  </form>
+  <form id="settle">
+    <input name="shift_id" value="S-001" size="7">
+    <input name="idempotency_key" placeholder="幂等键(可选)">
+    <button type="submit">结算封班</button>
+  </form>
+  <form id="reopen">
+    <input name="shift_id" value="S-001" size="7">
+    <input name="reason" value="补录后重结">
+    <button type="submit">挂起后重开补录</button>
+  </form>
+  <form id="close"><input name="shift_id" value="S-001" size="7"><button type="submit">关账（停止录入）</button></form>
+
+  <h2>班次</h2>
+  <table id="shifts"><thead><tr><th>班次</th><th>班组</th><th>状态</th><th>盘数/分录</th><th>重开次数</th><th>结算结果</th></tr></thead><tbody></tbody></table>
+
+  <h2>已封班历史（哈希链）</h2>
+  <p>链校验 <span id="chain"></span></p>
+  <table id="history"><thead><tr><th>结算号</th><th>班次</th><th>结果</th><th>打盘</th><th>生产 m³</th><th>装走 m³</th><th>配方 m³</th><th>差异条数</th><th>哈希</th></tr></thead><tbody></tbody></table>
+
+  <script id="plant-state" type="application/json"><!--STATE--></script>
+  <script>
+    const state = JSON.parse(document.getElementById('plant-state').textContent || '{}');
+    const policyText = { suspend: '整班挂起', list_diffs: '单列差异继续结' };
+
+    for (const crew of state.crews || []) {
+      document.querySelector('#crews tbody').insertAdjacentHTML('beforeend',
+        `<tr><td>${crew.crew_id}</td><td>${crew.name}</td><td>${policyText[crew.mismatch_policy] ?? crew.mismatch_policy}</td><td>${crew.tolerance_m3}</td></tr>`);
+    }
+    for (const shift of state.shifts || []) {
+      document.querySelector('#shifts tbody').insertAdjacentHTML('beforeend',
+        `<tr><td><a href="/api/shift/detail?shift_id=${shift.shift_id}">${shift.shift_id}</a></td><td>${shift.crew.crew_id}</td>
+         <td><span class="tag ${shift.status}">${shift.status}</span></td>
+         <td>${shift.entry_count}</td><td>${shift.reopen_count}</td>
+         <td>${shift.settlement ? shift.settlement.outcome : ''}</td></tr>`);
+    }
+    for (const s of state.settlements || []) {
+      document.querySelector('#history tbody').insertAdjacentHTML('beforeend',
+        `<tr><td>${s.settlement_id}</td><td>${s.shift_id}</td><td>${s.outcome}</td>
+         <td>${s.totals.tray_count}</td><td>${s.totals.produced_m3}</td>
+         <td>${s.totals.loaded_m3}</td><td>${s.totals.recipe_m3 ?? ''}</td>
+         <td class="${s.differences.length ? 'diff' : ''}">${s.differences.length}</td>
+         <td><code>${(s.hash || '').slice(0, 12)}</code></td></tr>`);
+    }
+    document.getElementById('chain').textContent = (state.verification && state.verification.ok) ? '通过 ✓' : '不通过 ✗';
+
+    async function post(path, form) {
+      const entries = Object.fromEntries(new FormData(form).entries());
+      const response = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(entries) });
+      return response.json();
+    }
+    const routes = {
+      crew: '/api/shift/crews', open: '/api/shift/open', close: '/api/shift/close',
+      tray: '/api/shift/trays', slip: '/api/shift/slips', usage: '/api/shift/usage',
+      capture: '/api/shift/capture', reconcile: '/api/shift/reconcile',
+      settle: '/api/shift/settle', reopen: '/api/shift/reopen',
+    };
+    for (const [id, path] of Object.entries(routes)) {
+      document.getElementById(id).addEventListener('submit', async (event) => {
+        event.preventDefault();
+        await post(path, event.target);
+        location.reload();
+      });
+    }
+    document.getElementById('preview').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const shiftId = new FormData(event.target).get('shift_id');
+      const data = await fetch(`/api/shift/preview?shift_id=${shiftId}`).then(r => r.json());
+      document.getElementById('preview-out').textContent = JSON.stringify(data.statement, null, 2);
+    });
+  </script>
+</body>
+</html>

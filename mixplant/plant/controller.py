@@ -9,6 +9,7 @@ from .diagnostics import run_diagnostics
 from .manifest import describe_manifest
 from .mix import mix_view
 from .recipe import recipe_view
+from .shift import shift_view
 from .truck import truck_view
 
 
@@ -51,6 +52,9 @@ class PlantController:
             "audit": self.runtime.audit.recent(),
             "counts": self.runtime.audit.counts(),
         }
+
+    def shift_view(self) -> dict[str, Any]:
+        return shift_view(self.runtime.shifts)
 
     def manifest(self) -> dict[str, Any]:
         return describe_manifest(

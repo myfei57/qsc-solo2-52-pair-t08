@@ -47,6 +47,19 @@ class AuditService(PlantService):
             audit_entry(name=event.name, origin=event.origin, tick=event.tick, detail=dict(event.payload))
         )
 
+    def handle_shift(self, event: Event) -> None:
+        """Copy a shift settlement event into the audit ledger.
+
+        The closeout itself is durable in the ``shift.*`` records; this entry
+        makes the same fact visible on the console audit page without writing a
+        second stream record.
+        """
+
+        if event.name in {"shift.settled", "shift.settle_blocked", "shift.suspended"}:
+            self.ledger.record(
+                audit_entry(name=event.name, origin=event.origin, tick=event.tick, detail=dict(event.payload))
+            )
+
     def rollup(self) -> dict[str, Any]:
         """Write and return the current production roll-up."""
 

@@ -17,12 +17,12 @@ from tests.support import publish_and_select
 
 
 def test_pages_are_declared() -> None:
-    assert set(PAGES) == {"recipe", "batch", "discharge", "alarms"}
+    assert set(PAGES) == {"recipe", "batch", "discharge", "alarms", "shift"}
 
 
 def test_every_page_renders_with_live_state(runtime: PlantRuntime) -> None:
     store = PageStore(runtime.config.web_dir)
-    assert store.names() == ("alarms", "batch", "discharge", "recipe")
+    assert store.names() == ("alarms", "batch", "discharge", "recipe", "shift")
     for name in store.names():
         page = store.load(name)
         rendered = inject_snapshot(page, runtime.state())
@@ -124,3 +124,57 @@ def test_confirm_payload_is_validated() -> None:
         pass
     else:  # pragma: no cover
         raise AssertionError("expected a ValidationError")
+
+
+def test_shift_console_routes_and_settlement(runtime: PlantRuntime) -> None:
+    server = ConsoleServer(runtime, pages=PageStore(runtime.config.web_dir))
+
+    def post(path: str, body: dict):
+        return server.handle(Request(method="POST", path=path, body=body))
+
+    assert post("/api/shift/crews", {
+        "crew_id": "A", "name": "甲班", "mismatch_policy": "suspend", "tolerance_m3": 0.5
+    }).ok
+    assert post("/api/shift/open", {"shift_id": "S1", "crew_id": "A"}).ok
+    assert post("/api/shift/trays", {
+        "shift_id": "S1", "ref": "t1", "grade": "C30", "volume_m3": 6
+    }).ok
+    assert post("/api/shift/slips", {
+        "shift_id": "S1", "ref": "s1", "grade": "C30", "volume_m3": 6
+    }).ok
+    assert post("/api/shift/usage", {
+        "shift_id": "S1", "ref": "u1", "grade": "C30",
+        "material": "cement", "consumed_kg": 1980, "factor_kg_per_m3": 330,
+    }).ok
+    assert post("/api/shift/close", {"shift_id": "S1"}).ok
+    settle = post("/api/shift/settle", {"shift_id": "S1"})
+    assert settle.ok
+    assert json.loads(settle.text)["result"]["settlement"]["outcome"] == "settled"
+
+    page = server.handle(Request(method="GET", path="/pages/shift"))
+    assert page.status == 200
+    view = json.loads(server.handle(Request(method="GET", path="/api/shift")).text)
+    assert view["verification"]["ok"] is True
+    verify = json.loads(server.handle(Request(method="GET", path="/api/shift/verify")).text)
+    assert verify["ok"] is True
+    history = json.loads(server.handle(Request(method="GET", path="/api/shift/settlements")).text)
+    assert len(history["settlements"]) == 1
+
+
+def test_settled_shift_rejects_mutation_over_http(runtime: PlantRuntime) -> None:
+    server = ConsoleServer(runtime, pages=PageStore(runtime.config.web_dir))
+
+    def post(path: str, body: dict):
+        return server.handle(Request(method="POST", path=path, body=body))
+
+    post("/api/shift/crews", {"crew_id": "A", "name": "乙班", "mismatch_policy": "list_diffs"})
+    post("/api/shift/open", {"shift_id": "S1", "crew_id": "A"})
+    post("/api/shift/trays", {"shift_id": "S1", "ref": "t1", "grade": "C30", "volume_m3": 6})
+    post("/api/shift/close", {"shift_id": "S1"})
+    post("/api/shift/settle", {"shift_id": "S1"})
+    refused = post("/api/shift/trays", {"shift_id": "S1", "ref": "t2", "grade": "C30", "volume_m3": 6})
+    assert refused.status == 409
+    # A repeated settlement is still a successful, idempotent replay.
+    repeat = post("/api/shift/settle", {"shift_id": "S1"})
+    assert repeat.ok
+    assert json.loads(repeat.text)["result"].get("replayed") is True

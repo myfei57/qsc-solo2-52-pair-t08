@@ -18,7 +18,7 @@ from .decision.thresholds import ThresholdSet
 from .errors import NotFoundError
 from .event.bus import Event, EventBus
 from .event.subscribers import AlarmCollector, AuditSubscriber
-from .event.topics import ALARM, STORE
+from .event.topics import ALARM, SHIFT, STORE
 from .ids import SequenceIds
 from .interlocks import build_engine
 from .mix.service import MixService
@@ -35,6 +35,7 @@ from .recipe.recipe import Recipe
 from .recipe.service import RecipeService
 from .sampler.service import SamplerService
 from .service_base import PlantService
+from .shift.service import ShiftService
 from .statemachine.gate import PreGate
 from .statemachine.machine import SequenceMachine
 from .statemachine.phases import LINE_SEQUENCES
@@ -109,6 +110,7 @@ class PlantRuntime:
         self.chute = ChuteService(self.context, self.recipes, self.machines["mix"])
         self.pump = PumpService(self.context, self.machines["delivery"])
         self.sampler = SamplerService(self.context, self.recipes, self.machines["delivery"])
+        self.shifts = ShiftService(self.context, self.machines["batch"])
         self.audit = AuditService(self.context, self.machines["batch"], alarms=self.alarms)
         self.controller = PlantController(self)
         self.boot_report: RestoreReport | None = None
@@ -122,6 +124,7 @@ class PlantRuntime:
             "chute": self.chute,
             "pump": self.pump,
             "sampler": self.sampler,
+            "shift": self.shifts,
             "audit": self.audit,
         }
         self._wire_bus()
@@ -135,6 +138,7 @@ class PlantRuntime:
     def _wire_bus(self) -> None:
         self.bus.subscribe(ALARM, self.alarms)
         self.bus.subscribe(ALARM, self.audit.handle_alarm)
+        self.bus.subscribe(SHIFT, self.audit.handle_shift)
         self.bus.subscribe_all(self.audit_subscriber)
 
     def bootstrap(self) -> dict[str, Any]:
@@ -146,6 +150,8 @@ class PlantRuntime:
         self._restore_id_counters()
         self._adopt_records()
         self._hydrate_machines()
+        self.shifts.hydrate()
+        self._restore_shift_id_counters()
         self.store.publish(
             BOOT_KIND,
             "console",
@@ -240,6 +246,18 @@ class PlantRuntime:
                 step=int(record.payload["step"]),
                 tick=record.tick,
             )
+
+    def _restore_shift_id_counters(self) -> None:
+        """Raise shift id counters so a restart never reissues an id."""
+
+        entries = settlements = 0
+        for record in self.store.visible():
+            if record.kind == "shift.entry":
+                entries += 1
+            elif record.kind == "shift.settle":
+                settlements += 1
+        self.ids.restore("shentry", entries)
+        self.ids.restore("shsettle", settlements)
 
     def health(self) -> dict[str, Any]:
         """Return the values a health probe needs."""
@@ -459,6 +477,60 @@ class PlantRuntime:
             "sampler.draw": lambda payload: self.sampler.draw(litres=number(payload, "litres")),
             "sampler.release": lambda payload: self.sampler.release(),
             "sampler.file": lambda payload: self._file_sample(number(payload, "litres")),
+            "shift.register_crew": lambda payload: self.shifts.register_crew(
+                crew_id=text(payload, "crew_id"),
+                name=text(payload, "name"),
+                mismatch_policy=text(payload, "mismatch_policy"),
+                tolerance_m3=optional_number(payload, "tolerance_m3", 0.5),
+            ),
+            "shift.open": lambda payload: self.shifts.open_shift(
+                shift_id=text(payload, "shift_id"),
+                crew_id=text(payload, "crew_id"),
+                note=optional_text(payload, "note", ""),
+            ),
+            "shift.close": lambda payload: self.shifts.close_shift(text(payload, "shift_id")),
+            "shift.record_tray": lambda payload: self.shifts.record_tray(
+                shift_id=text(payload, "shift_id"),
+                ref=text(payload, "ref"),
+                grade=text(payload, "grade"),
+                volume_m3=number(payload, "volume_m3"),
+                note=optional_text(payload, "note", ""),
+            ),
+            "shift.record_slip": lambda payload: self.shifts.record_slip(
+                shift_id=text(payload, "shift_id"),
+                ref=text(payload, "ref"),
+                grade=text(payload, "grade"),
+                volume_m3=number(payload, "volume_m3"),
+                note=optional_text(payload, "note", ""),
+            ),
+            "shift.record_usage": lambda payload: self.shifts.record_usage(
+                shift_id=text(payload, "shift_id"),
+                ref=text(payload, "ref"),
+                grade=text(payload, "grade"),
+                material=text(payload, "material"),
+                consumed_kg=number(payload, "consumed_kg"),
+                factor_kg_per_m3=optional_number(payload, "factor_kg_per_m3", 0.0) or None,
+                recipe_name=(payload.get("recipe_name") or None),
+                note=optional_text(payload, "note", ""),
+            ),
+            "shift.reverse_entry": lambda payload: self.shifts.reverse_entry(
+                shift_id=text(payload, "shift_id"),
+                entry_id=text(payload, "entry_id"),
+                note=optional_text(payload, "note", "correction"),
+            ),
+            "shift.capture": lambda payload: self.shifts.capture_plant(text(payload, "shift_id")),
+            "shift.preview": lambda payload: self.shifts.preview(text(payload, "shift_id")),
+            "shift.reconcile": lambda payload: self.shifts.reconcile(
+                text(payload, "shift_id"),
+                idempotency_key=optional_text(payload, "idempotency_key", "") or None,
+            ),
+            "shift.settle": lambda payload: self.shifts.settle(
+                text(payload, "shift_id"),
+                idempotency_key=optional_text(payload, "idempotency_key", "") or None,
+            ),
+            "shift.reopen": lambda payload: self.shifts.reopen_shift(
+                text(payload, "shift_id"), reason=optional_text(payload, "reason", "correction after suspension")
+            ),
             "audit.note": lambda payload: self.audit.note(
                 text(payload, "name"), self._detail(payload)
             ),
